@@ -88,6 +88,14 @@ trigger on `profiles` was blocking XP updates made by the app's own
 declared as `uuid[]` when the app actually sends plain text ids. Safe to
 re-run; both files are idempotent.
 
+**Then also run `supabase/patch_fix_xp_overload.sql` once.** Changing a
+function's parameter type with `create or replace` doesn't replace it in
+Postgres — a different argument type creates a second, overloaded function,
+leaving two versions of `complete_practice` in place and every call
+ambiguous. This patch explicitly drops the old signature first, adds
+explicit `grant execute` statements, and adds a few defensive RLS insert
+policies — run it even if you already ran the previous patch.
+
 ## 9. Run the project
 
 ```bash

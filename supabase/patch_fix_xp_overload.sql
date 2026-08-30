@@ -1,43 +1,28 @@
--- Run this ONCE against your existing Supabase project (SQL editor, or
--- `supabase db push` if you fold it into a migration). Safe to re-run.
+-- Run this instead of / in addition to patch_fix_practice_completion.sql.
+-- Safe to re-run any number of times.
 --
--- Fixes two bugs that made "Mashq tugadi" (finish practice) hang / silently
--- give 0 XP, and made purchases from the shop fail the same way:
+-- WHY XP/STREAK WAS STILL BROKEN AFTER THE LAST PATCH:
+-- Postgres identifies a function by name *and* argument types. The old
+-- complete_practice() took `p_wrong_item_ids uuid[]`; the patch tried to
+-- swap it for `text[]` using `create or replace`, but since the argument
+-- type changed, Postgres didn't replace anything — it silently created a
+-- SECOND, overloaded function. With two versions of complete_practice()
+-- sitting side by side, calling it becomes ambiguous and fails, which is
+-- exactly the "Xatolik yuz berdi" you were still seeing. This script
+-- explicitly drops every old version by its exact old signature first, so
+-- there's only ever one complete_practice() left afterwards.
 --
--- BUG 1 — the profiles guard trigger blocked its own RPCs.
---   `prevent_self_privilege_escalation` (schema.sql) raises an exception any
---   time profiles.xp/role/status changes and the caller isn't an admin. But
---   complete_practice() and purchase_shop_item() are SECURITY DEFINER
---   functions that update profiles.xp on behalf of ordinary students — the
---   trigger has no way to tell "a trusted RPC did this" from "the student
---   tried to edit their own XP directly", so it blocked BOTH, and the whole
---   RPC call (and the enclosing transaction) failed every time XP was owed.
---   That's why the finish button looked unresponsive whenever a completion
---   would have earned XP, and why XP was never actually granted.
---
--- BUG 2 — wrong-answer IDs were sent as uuid[] but the app's lesson content
---   uses plain string ids (e.g. "r-a1-1"), which are not valid UUIDs. Any
---   session with at least one wrong answer made complete_practice() fail
---   with a "invalid input syntax for type uuid" error before it could do
---   anything else. This hit listening/reading hardest since those sections
---   only had one question, so a single wrong answer broke the finish step
---   every time.
+-- This also adds explicit GRANT EXECUTE statements and small defensive RLS
+-- insert policies, so there's no ambiguity around "ruxsat" (permissions)
+-- either way.
 
--- ---- Fix 2: switch question-id tracking from uuid to text ----
-alter table student_progress drop constraint if exists student_progress_question_id_fkey;
-alter table student_progress alter column question_id type text using question_id::text;
-
--- Drop the old uuid[]-parameter version explicitly: Postgres identifies a
--- function by name AND argument types, so `create or replace` below with a
--- different parameter type does NOT replace this — it silently creates a
--- second, overloaded function, leaving calls ambiguous. (If you've already
--- hit this, run patch_fix_xp_overload.sql instead — it cleans this up too.)
+-- ---- 1. Remove every old signature so nothing is left overloaded ----
 drop function if exists complete_practice(text, text, integer, integer, uuid[]);
+drop function if exists complete_practice(text, text, integer, integer, text[]);
+drop function if exists complete_practice(text, text, integer, integer);
+drop function if exists purchase_shop_item(uuid);
 
--- ---- Fix 1: let trusted SECURITY DEFINER functions bypass the guard ----
--- The functions set a transaction-local flag right before touching
--- profiles; the trigger checks for that flag instead of assuming every
--- caller is either "admin" or "not to be trusted".
+-- ---- 2. Recreate everything clean (same bodies as the previous patch) ----
 create or replace function prevent_self_privilege_escalation() returns trigger language plpgsql as $$
 begin
   if not is_admin() and coalesce(current_setting('app.bypass_profile_guard', true), 'false') <> 'true' then
@@ -49,7 +34,7 @@ begin
 end;
 $$;
 
-create or replace function complete_practice(
+create function complete_practice(
   p_category text, p_level text, p_correct integer, p_total integer, p_wrong_item_ids text[] default '{}'
 ) returns json language plpgsql security definer as $$
 declare
@@ -63,7 +48,6 @@ declare
 begin
   if v_user is null then raise exception 'Not authenticated'; end if;
 
-  -- one XP-earning attempt per category+level+day (unique constraint doubles as guard)
   select exists(
     select 1 from quiz_attempts where user_id = v_user and category = p_category and level = p_level and attempt_date = current_date
   ) into v_dup;
@@ -90,7 +74,6 @@ begin
     where id = v_user;
   end if;
 
-  -- track wrong answers for spaced review (question ids are plain text, not DB uuids)
   if array_length(p_wrong_item_ids, 1) > 0 then
     insert into student_progress (user_id, question_id, last_result, attempts, needs_review)
     select v_user, unnest(p_wrong_item_ids), false, 1, true
@@ -102,7 +85,7 @@ begin
 end;
 $$;
 
-create or replace function purchase_shop_item(p_item_id uuid) returns json language plpgsql security definer as $$
+create function purchase_shop_item(p_item_id uuid) returns json language plpgsql security definer as $$
 declare
   v_user uuid := auth.uid();
   v_price integer;
@@ -127,3 +110,29 @@ begin
   return json_build_object('ok', true, 'remaining_xp', v_xp - v_price);
 end;
 $$;
+
+-- ---- 3. Explicit permissions, so this can never be a "ruxsat" question ----
+grant execute on function complete_practice(text, text, integer, integer, text[]) to authenticated;
+grant execute on function purchase_shop_item(uuid) to authenticated;
+grant execute on function xp_for_level(text) to authenticated;
+
+-- ---- 4. Defensive insert policies ----
+-- complete_practice()/purchase_shop_item() write through table-owner
+-- bypass, which is normally enough — but if this project's functions ever
+-- end up owned by a non-owner role, these policies make direct,
+-- self-scoped inserts work too, at no cost to security (still limited to
+-- inserting only your own rows).
+drop policy if exists "attempts insert own" on quiz_attempts;
+create policy "attempts insert own" on quiz_attempts for insert with check (user_id = auth.uid());
+
+drop policy if exists "xp insert own" on xp_transactions;
+create policy "xp insert own" on xp_transactions for insert with check (user_id = auth.uid());
+
+drop policy if exists "progress insert own" on student_progress;
+create policy "progress insert own" on student_progress for insert with check (user_id = auth.uid());
+
+drop policy if exists "progress update own" on student_progress;
+create policy "progress update own" on student_progress for update using (user_id = auth.uid());
+
+drop policy if exists "purchases insert own" on shop_purchases;
+create policy "purchases insert own" on shop_purchases for insert with check (user_id = auth.uid());
