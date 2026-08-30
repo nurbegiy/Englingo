@@ -98,7 +98,7 @@ export default function ActivityRunnerPage() {
             </div>
           </div>
           {summary?.duplicate && (
-            <p className="text-xs text-muted mb-4">Already practiced today — come back tomorrow for more XP.</p>
+            <p className="text-xs text-muted mb-4">That submitted too quickly after your last one — wait a moment and try the next session.</p>
           )}
           <Button className="w-full" onClick={() => navigate('/app/learn')}>{t('home.continue')}</Button>
         </Card>

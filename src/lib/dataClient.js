@@ -91,56 +91,48 @@ export async function submitPlacementResult(userId, estimatedLevel) {
 }
 
 // ---------------- Learning content ----------------
-// Small deterministic string hash -> seed for a PRNG (mulberry32), so the
-// "random" pick is stable for a given user+category+level+day but changes
-// again tomorrow — no repeats within the same day, different sets day to day.
-function hashSeed(str) {
-  let h = 1779033703 ^ str.length
-  for (let i = 0; i < str.length; i++) {
-    h = Math.imul(h ^ str.charCodeAt(i), 3432918353)
-    h = (h << 13) | (h >>> 19)
-  }
-  return () => {
-    h = Math.imul(h ^ (h >>> 16), 2246822507)
-    h = Math.imul(h ^ (h >>> 13), 3266489909)
-    h ^= h >>> 16
-    return h >>> 0
-  }
-}
-
-function seededShuffle(arr, seedStr) {
-  const rand = hashSeed(seedStr)
+function shuffleArray(arr) {
   const copy = [...arr]
   for (let i = copy.length - 1; i > 0; i--) {
-    const j = rand() % (i + 1)
+    const j = Math.floor(Math.random() * (i + 1))
     ;[copy[i], copy[j]] = [copy[j], copy[i]]
   }
   return copy
 }
 
-const SESSION_SIZE = 5
+function shuffleOptions(item) {
+  if (!item.options) return item
+  const idxs = shuffleArray(item.options.map((_, i) => i))
+  return { ...item, options: idxs.map((i) => item.options[i]), answer: idxs.indexOf(item.answer) }
+}
 
-// Picks a fresh-looking, per-day-seeded subset/order of questions instead of
-// always returning the whole bank in the same order (so the same question
-// doesn't show up every single day). Falls back to the whole set when the
-// bank is smaller than one session.
-export function getLessonSet(category, level, userId = 'anon') {
+const SESSION_SIZE = 10
+
+// Draws a fresh random subset AND a fresh random option order every single
+// time this is called — every practice session looks different, even for
+// the same category+level, instead of the same fixed handful of questions.
+export function getLessonSet(category, level) {
   const pool = mock.lessons[category]?.[level] || []
   if (pool.length === 0) return []
-  const seed = `${userId}-${category}-${level}-${todayStr()}`
-  const shuffled = seededShuffle(pool, seed)
-  return shuffled.slice(0, Math.min(SESSION_SIZE, shuffled.length))
+  const picked = shuffleArray(pool).slice(0, Math.min(SESSION_SIZE, pool.length))
+  return picked.map(shuffleOptions)
 }
 
 export function xpForLevel(level) {
   return mock.XP_BY_LEVEL[level] || 10
 }
 
-// Anti-abuse: one XP-earning completion per category+level per user per day
-function alreadyCompletedToday(userId, category, level) {
-  return mock.quizAttempts.some(
-    (a) => a.user_id === userId && a.category === category && a.level === level && a.date === todayStr(),
-  )
+// Light anti-spam guard only (not a daily cap): blocks literal instant
+// double-submits (e.g. a duplicate network retry within a couple seconds),
+// not genuine repeated self-study sessions — those are meant to earn XP
+// every time, since students may want to practice the same category many
+// times a day.
+const MIN_MS_BETWEEN_ATTEMPTS = 4000
+function tooSoonSinceLastAttempt(userId, category, level) {
+  const attempts = mock.quizAttempts.filter((a) => a.user_id === userId && a.category === category && a.level === level)
+  if (attempts.length === 0) return false
+  const last = attempts[attempts.length - 1]
+  return Date.now() - (last.ts || 0) < MIN_MS_BETWEEN_ATTEMPTS
 }
 
 export async function completePractice({ userId, category, level, correct, total, wrongItemIds = [] }) {
@@ -162,10 +154,10 @@ export async function completePractice({ userId, category, level, correct, total
     return data // { xp_awarded, streak_current, streak_best }
   }
 
-  const dup = alreadyCompletedToday(userId, category, level)
+  const dup = tooSoonSinceLastAttempt(userId, category, level)
   const xpAwarded = dup ? 0 : earned
 
-  mock.quizAttempts.push({ id: uid('qa'), user_id: userId, category, level, correct, total, date: todayStr() })
+  mock.quizAttempts.push({ id: uid('qa'), user_id: userId, category, level, correct, total, date: todayStr(), ts: Date.now() })
   wrongItemIds.forEach((itemId) => mock.wrongAnswers.push({ id: uid('wa'), user_id: userId, item_id: itemId, category, resolved: false }))
 
   const profile = mock.profiles.find((p) => p.id === userId)

@@ -90,8 +90,10 @@ create table if not exists quiz_attempts (
   correct integer not null,
   total integer not null,
   attempt_date date not null default current_date,
-  created_at timestamptz not null default now(),
-  unique (user_id, category, level, attempt_date) -- one XP-earning attempt per day
+  created_at timestamptz not null default now()
+  -- Repeated self-study sessions are allowed and each earns XP; only
+  -- complete_practice()'s short time-based guard prevents literal
+  -- double-submits, so no daily uniqueness constraint here.
 );
 
 create table if not exists xp_transactions (

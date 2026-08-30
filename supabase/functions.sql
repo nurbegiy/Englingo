@@ -21,24 +21,26 @@ declare
   v_user uuid := auth.uid();
   v_base integer;
   v_earned integer;
-  v_dup boolean;
+  v_too_soon boolean;
   v_current integer;
   v_best integer;
   v_last date;
 begin
   if v_user is null then raise exception 'Not authenticated'; end if;
 
-  -- one XP-earning attempt per category+level+day (unique constraint doubles as guard)
+  -- Self-study is meant to be repeated many times a day and earn XP every
+  -- time. The only guard here is a short cooldown against a literal
+  -- double-submit (e.g. a duplicate network retry) — not a daily cap.
   select exists(
-    select 1 from quiz_attempts where user_id = v_user and category = p_category and level = p_level and attempt_date = current_date
-  ) into v_dup;
+    select 1 from quiz_attempts
+    where user_id = v_user and category = p_category and level = p_level
+      and created_at > now() - interval '4 seconds'
+  ) into v_too_soon;
 
   v_base := xp_for_level(p_level);
-  v_earned := case when v_dup then 0 else round(v_base * greatest(0.4, p_correct::numeric / greatest(p_total, 1))) end;
+  v_earned := case when v_too_soon then 0 else round(v_base * greatest(0.4, p_correct::numeric / greatest(p_total, 1))) end;
 
-  if not v_dup then
-    insert into quiz_attempts (user_id, category, level, correct, total) values (v_user, p_category, p_level, p_correct, p_total);
-  end if;
+  insert into quiz_attempts (user_id, category, level, correct, total) values (v_user, p_category, p_level, p_correct, p_total);
 
   select streak_current, streak_best, last_activity_date into v_current, v_best, v_last from profiles where id = v_user;
 
@@ -62,7 +64,7 @@ begin
       set last_result = false, attempts = student_progress.attempts + 1, needs_review = true, updated_at = now();
   end if;
 
-  return json_build_object('xp_awarded', v_earned, 'streak_current', v_current, 'streak_best', v_best, 'duplicate', v_dup);
+  return json_build_object('xp_awarded', v_earned, 'streak_current', v_current, 'streak_best', v_best, 'duplicate', v_too_soon);
 end;
 $$;
 
